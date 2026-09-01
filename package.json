@@ -1,0 +1,16 @@
+{
+  "name": "file-scanner",
+  "version": "1.0.0",
+  "description": "Simple Node.js file scanner using chokidar and low-json-db",
+  "main": "file-scanner.js",
+  "scripts": {
+    "start": "node example.js",
+    "scan": "node example.js"
+  },
+  "keywords": ["chokidar", "low-json-db", "file-scanner", "watcher"],
+  "license": "MIT",
+  "dependencies": {
+    "chokidar": "^4.0.3",
+    "low-json-db": "^1.0.2"
+  }
+}
