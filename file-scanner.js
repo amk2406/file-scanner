@@ -1,309 +1,504 @@
-const fs = require("fs");
-const path = require("path");
-const { EventEmitter } = require("events");
-const chokidar = require("chokidar");
-const { JSONDB } = require("low-json-db");
-const { classify } = require("./categories");
+/**
+ * FileScanner
+ * A powerful file system scanner using chokidar + filejson-db
+ *
+ * Features:
+ * - Full scan + live watching
+ * - Smart re-scan (checks if path already exists)
+ * - Category filtering
+ * - Configurable delay
+ * - Events: add, change, unlink, scan-start, scan-end, finish, error
+ * - Utilities: getFiles, find, findOne, count, deleteAll
+ */
 
-function toPosix(filePath) {
-  return String(filePath).split(path.sep).join("/");
-}
+'use strict';
 
-function asList(value) {
-  if (value == null || value === "") return [];
-  if (Array.isArray(value)) {
-    return value.flatMap((item) => asList(item));
+const fs = require('fs');
+const path = require('path');
+const { EventEmitter } = require('events');
+const chokidar = require('chokidar');
+
+// Try to load chunkjson-db from different possible locations
+let JSONDB;
+try {
+  JSONDB = require('filejson-db').JSONDB;
+} catch (e) {
+  try {
+    JSONDB = require('../file-json-db').JSONDB;
+  } catch (e2) {
+    try {
+      JSONDB = require('../file-json-db/index.js').JSONDB;
+    } catch (e3) {
+      throw new Error('file-json-db is required. Please make sure it is available.');
+    }
   }
-  return String(value)
-    .split(/[\n,]/)
-    .map((item) => item.trim())
-    .filter(Boolean);
 }
 
-function globToRegExp(pattern, caseSensitive) {
-  const escaped = pattern
-    .replace(/[.+^${}()|[\]\\]/g, "\\$&")
-    .replace(/\*/g, ".*")
-    .replace(/\?/g, ".");
-  return new RegExp(`^${escaped}$`, caseSensitive ? "" : "i");
-}
+// ====================== CATEGORY MAP ======================
+const EXTENSION_CATEGORIES = {
+  // Code
+  '.js': 'code', '.ts': 'code', '.jsx': 'code', '.tsx': 'code',
+  '.py': 'code', '.java': 'code', '.c': 'code', '.cpp': 'code',
+  '.h': 'code', '.hpp': 'code', '.cs': 'code', '.go': 'code',
+  '.rs': 'code', '.php': 'code', '.rb': 'code', '.swift': 'code',
+  '.kt': 'code', '.scala': 'code', '.sh': 'code', '.bash': 'code',
+  '.json': 'code', '.yml': 'code', '.yaml': 'code', '.xml': 'code',
+  '.html': 'code', '.css': 'code', '.scss': 'code', '.sass': 'code',
+  '.vue': 'code', '.svelte': 'code',
 
-const VIRTUAL = ["/proc", "/sys", "/dev", "/run"];
-const SYSTEM = [
-  "/proc",
-  "/sys",
-  "/dev",
-  "/run",
-  "/usr",
-  "/bin",
-  "/sbin",
-  "/boot",
-  "/lib",
-  "/lib64",
-  "/etc",
-  "/opt",
-  "/System",
-  "/Library",
-  "/Applications",
-  "/Windows",
-  "/Program Files",
-  "/Program Files (x86)",
-  "/ProgramData",
-  "C:/Windows",
-  "C:/Program Files",
-  "C:/Program Files (x86)",
-  "C:/ProgramData",
+  // Image
+  '.png': 'image', '.jpg': 'image', '.jpeg': 'image', '.gif': 'image',
+  '.webp': 'image', '.svg': 'image', '.bmp': 'image', '.ico': 'image',
+  '.tiff': 'image', '.tif': 'image',
+
+  // Video
+  '.mp4': 'video', '.mkv': 'video', '.avi': 'video', '.mov': 'video',
+  '.wmv': 'video', '.flv': 'video', '.webm': 'video', '.m4v': 'video',
+
+  // Audio
+  '.mp3': 'audio', '.wav': 'audio', '.flac': 'audio', '.aac': 'audio',
+  '.ogg': 'audio', '.m4a': 'audio', '.wma': 'audio',
+
+  // Document
+  '.pdf': 'document', '.doc': 'document', '.docx': 'document',
+  '.xls': 'document', '.xlsx': 'document', '.ppt': 'document',
+  '.pptx': 'document', '.txt': 'document', '.md': 'document',
+  '.rtf': 'document', '.odt': 'document', '.csv': 'document',
+
+  // Archive
+  '.zip': 'archive', '.rar': 'archive', '.7z': 'archive',
+  '.tar': 'archive', '.gz': 'archive', '.bz2': 'archive',
+  '.xz': 'archive'
+};
+
+// Default ignore patterns
+const DEFAULT_IGNORED = [
+  '**/.git/**',
+  '**/node_modules/**',
+  '**/.next/**',
+  '**/dist/**',
+  '**/build/**',
+  '**/.DS_Store',
+  '**/Thumbs.db',
+  '**/.cache/**',
+  '**/coverage/**',
+  '**/.vscode/**',
+  '**/.idea/**'
 ];
 
-function startsWithPrefix(filePath, prefixes) {
-  const lower = toPosix(filePath).toLowerCase();
-  return prefixes.some((prefix) => {
-    const n = toPosix(prefix).toLowerCase().replace(/\/+$/, "");
-    return lower === n || lower.startsWith(`${n}/`);
-  });
-}
-
-function matchesFolder(filePath, folder, caseSensitive) {
-  const p = caseSensitive ? toPosix(filePath) : toPosix(filePath).toLowerCase();
-  const f = (caseSensitive ? toPosix(folder) : toPosix(folder).toLowerCase()).replace(
-    /\/+$/,
-    "",
-  );
-  if (!f) return false;
-  if (p === f || p.startsWith(`${f}/`)) return true;
-  const name = f.split("/").pop();
-  return p.split("/").includes(name);
-}
-
-function matchesFile(filePath, pattern, caseSensitive) {
-  const base = path.basename(filePath);
-  const re = globToRegExp(pattern, caseSensitive);
-  return re.test(base) || re.test(toPosix(filePath));
-}
-
-function resolveOne(input) {
-  if (!input) return process.cwd();
-  if (path.isAbsolute(input)) return path.resolve(input);
-  return path.resolve(process.cwd(), input);
-}
-
-function statFile(filePath) {
-  try {
-    const stat = fs.statSync(filePath);
-    if (!stat.isFile()) return null;
-    const name = path.basename(filePath);
-    return {
-      path: toPosix(path.resolve(filePath)),
-      name,
-      ext: path.extname(filePath).toLowerCase(),
-      dir: toPosix(path.dirname(path.resolve(filePath))),
-      size: stat.size,
-      mtimeMs: stat.mtimeMs,
-      ctimeMs: stat.ctimeMs,
-      category: classify(name),
-      updatedAt: new Date().toISOString(),
-    };
-  } catch {
-    return null;
-  }
-}
+// System directories (blocked unless allowSystemDir = true)
+const SYSTEM_DIRS = [
+  '/bin', '/sbin', '/usr', '/etc', '/var', '/lib', '/lib64',
+  '/boot', '/dev', '/proc', '/sys', '/run', '/snap',
+  'C:\\Windows', 'C:\\Program Files', 'C:\\Program Files (x86)'
+];
 
 class FileScanner extends EventEmitter {
   /**
-   * @param {object} [options]
-   * @param {string|string[]} [options.paths] Absolute or partial paths (alias: watchPath)
-   * @param {number} [options.delay=0] Milliseconds to wait before saving a file
-   * @param {string|string[]} [options.excludeFolder]
-   * @param {string|string[]} [options.excludeFile]
-   * @param {boolean} [options.scanSystemDirectory=false]
-   * @param {string|string[]} [options.categories] Only persist these kinds
-   * @param {boolean} [options.includeHidden=false]
-   * @param {boolean} [options.recursive=true]
-   * @param {number} [options.depth=0] 0 = unlimited
-   * @param {number} [options.minSize=0]
-   * @param {number} [options.maxSize=0]
-   * @param {boolean} [options.caseSensitive=false]
-   * @param {string} [options.dbDir='./data']
-   * @param {string} [options.collectionName='files']
-   * @param {boolean} [options.persistent=true]
-   * @param {boolean} [options.ignoreInitial=false]
+   * @param {Object} options
    */
   constructor(options = {}) {
     super();
-    const paths = asList(options.paths ?? options.watchPath ?? ".");
-    this.paths = paths.length ? paths.map(resolveOne) : [process.cwd()];
-    this.delay = Math.max(0, Number(options.delay ?? options.debounce ?? 0) || 0);
-    this.excludeFolder = asList(options.excludeFolder);
-    this.excludeFile = asList(options.excludeFile);
-    this.scanSystemDirectory = Boolean(options.scanSystemDirectory);
-    this.categories = asList(options.categories).map((item) => item.toLowerCase());
-    this.includeHidden = Boolean(options.includeHidden);
+
+    // Paths
+    this.paths = Array.isArray(options.paths)
+      ? options.paths
+      : (options.paths ? [options.paths] : []);
+
+    if (this.paths.length === 0) {
+      throw new Error('At least one path is required in options.paths');
+    }
+
+    // Database
+    this.dbPath = options.dbPath || './scanner-data';
+    this.collectionName = options.collectionName || 'files';
+
+    // Behavior
+    this.mode = options.mode || 'full'; // 'full' | 'watch' | 'scan-only'
     this.recursive = options.recursive !== false;
-    this.depth = Number(options.depth ?? 0) || 0;
-    this.minSize = Number(options.minSize ?? 0) || 0;
-    this.maxSize = Number(options.maxSize ?? 0) || 0;
-    this.caseSensitive = Boolean(options.caseSensitive);
-    this.dbDir = options.dbDir ?? "./data";
-    this.collectionName = options.collectionName ?? "files";
-    this.persistent = options.persistent !== false;
-    this.ignoreInitial = Boolean(options.ignoreInitial);
-    this.extraIgnored = options.ignored ?? [];
+    this.delay = typeof options.delay === 'number' ? options.delay : 5;
+    this.allowSystemDir = options.allowSystemDir === true;
 
-    this.db = new JSONDB(this.dbDir);
-    this.files = this.db.collection({
-      name: this.collectionName,
-      autoId: true,
-      idType: "uuid",
-      indexes: ["path", "category"],
-      pretty: true,
-    });
+    // Categories whitelist
+    this.categories = Array.isArray(options.categories) && options.categories.length > 0
+      ? options.categories
+      : ['code', 'image', 'document', 'video', 'audio', 'archive', 'folder', 'other'];
 
+    // Ignore patterns
+    this.ignored = [
+      ...DEFAULT_IGNORED,
+      ...(Array.isArray(options.ignored) ? options.ignored : [])
+    ];
+
+    // Internal
+    this.db = null;
+    this.collection = null;
     this.watcher = null;
-    this.pending = new Map();
+    this.isRunning = false;
+    this.isScanning = false;
+    this._stopRequested = false;
   }
 
-  isIgnored(filePath) {
-    const posix = toPosix(path.resolve(filePath));
-    const name = path.basename(posix);
+  // ====================== INIT DB ======================
+  _initDB() {
+    if (this.db) return;
 
-    if (startsWithPrefix(posix, [path.resolve(this.dbDir)])) return true;
-    if (posix.split("/").includes("node_modules")) return true;
-    if (startsWithPrefix(posix, VIRTUAL)) return true;
-    if (!this.scanSystemDirectory && startsWithPrefix(posix, SYSTEM)) return true;
+    this.db = new JSONDB(this.dbPath);
+    this.collection = this.db.collection({
+      name: this.collectionName,
+      autoId: true,
+      indexes: ['path', 'category', 'extension'],
+      pretty: true
+    });
+  }
 
-    if (!this.includeHidden) {
-      const parts = posix.split("/");
-      if (parts.some((part) => part.startsWith(".") && part !== "." && part !== "..")) {
-        return true;
-      }
-    }
+  // ====================== HELPERS ======================
+  _sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
 
-    if (this.excludeFolder.some((folder) => matchesFolder(posix, folder, this.caseSensitive))) {
-      return true;
+  _getCategory(filePath, isDirectory) {
+    if (isDirectory) return 'folder';
+    const ext = path.extname(filePath).toLowerCase();
+    return EXTENSION_CATEGORIES[ext] || 'other';
+  }
+
+  _isSystemPath(p) {
+    const normalized = path.resolve(p);
+    return SYSTEM_DIRS.some(sys => normalized.startsWith(sys));
+  }
+
+  _shouldIgnore(filePath) {
+    // Simple glob-like check for common cases
+    const normalized = filePath.replace(/\\/g, '/');
+
+    for (const pattern of this.ignored) {
+      // Very simple matching for **/.git/** style
+      const clean = pattern.replace(/\*\*/g, '.*').replace(/\*/g, '[^/]*');
+      const regex = new RegExp(clean.replace(/\//g, '\\/'));
+      if (regex.test(normalized)) return true;
     }
-    if (this.excludeFile.some((pattern) => matchesFile(posix, pattern, this.caseSensitive))) {
-      return true;
-    }
-    if (!this.recursive) {
-      const root = this.paths.find((item) => {
-        const r = toPosix(item);
-        return posix === r || posix.startsWith(`${r}/`);
-      });
-      if (root) {
-        const rel = posix.slice(toPosix(root).length);
-        if (rel.split("/").filter(Boolean).length > 1) return true;
-      }
-    }
-    if (this.depth > 0) {
-      const root = this.paths.find((item) => posix.startsWith(toPosix(item)));
-      if (root) {
-        const rel = posix.slice(toPosix(root).length);
-        if (rel.split("/").filter(Boolean).length > this.depth) return true;
-      }
-    }
-    if (typeof this.extraIgnored === "function") return this.extraIgnored(filePath);
     return false;
   }
 
-  shouldSave(record) {
-    if (!record) return false;
-    if (this.minSize > 0 && record.size < this.minSize) return false;
-    if (this.maxSize > 0 && record.size > this.maxSize) return false;
-    if (this.categories.length && !this.categories.includes(record.category)) return false;
-    return true;
+  _createFileDoc(filePath, stats) {
+    const isDirectory = stats.isDirectory();
+    const ext = isDirectory ? '' : path.extname(filePath).toLowerCase();
+    const category = this._getCategory(filePath, isDirectory);
+
+    // Only keep allowed categories
+    if (!this.categories.includes(category)) {
+      return null;
+    }
+
+    return {
+      path: path.resolve(filePath),
+      name: path.basename(filePath),
+      extension: ext,
+      ctime: stats.ctimeMs || stats.ctime.getTime(),
+      mtime: stats.mtimeMs || stats.mtime.getTime(),
+      size: isDirectory ? 0 : stats.size,
+      category
+    };
   }
 
-  schedule(filePath, kind) {
-    const prev = this.pending.get(filePath);
-    if (prev) clearTimeout(prev);
-    const run = () => {
-      this.pending.delete(filePath);
-      if (kind === "unlink") {
-        this.remove(filePath);
+  // ====================== CORE: UPSERT LOGIC ======================
+  /**
+   * Smart save:
+   * - If path does not exist → insert
+   * - If path exists → update only if mtime or size changed
+   */
+  _upsertFile(doc) {
+    if (!doc) return null;
+
+    const existing = this.collection.findOne({ path: doc.path });
+
+    if (!existing) {
+      // New file
+      const inserted = this.collection.insert(doc);
+      this.emit('add', inserted);
+      return inserted;
+    }
+
+    // Exists → check if changed
+    if (existing.mtime !== doc.mtime || existing.size !== doc.size) {
+      const updated = this.collection.updateOne(
+        { path: doc.path },
+        {
+          $set: {
+            name: doc.name,
+            extension: doc.extension,
+            ctime: doc.ctime,
+            mtime: doc.mtime,
+            size: doc.size,
+            category: doc.category
+          }
+        }
+      );
+      this.emit('change', updated || { ...existing, ...doc });
+      return updated;
+    }
+
+    // No change
+    return existing;
+  }
+
+  _removeFile(filePath) {
+    const fullPath = path.resolve(filePath);
+    const deleted = this.collection.deleteOne({ path: fullPath });
+    if (deleted) {
+      this.emit('unlink', deleted);
+    }
+    return deleted;
+  }
+
+  // ====================== FULL SCAN ======================
+  async _scanPath(rootPath) {
+    const results = { total: 0, added: 0, updated: 0, skipped: 0 };
+
+    const walk = async (currentPath) => {
+      if (this._stopRequested) return;
+
+      if (!this.allowSystemDir && this._isSystemPath(currentPath)) {
         return;
       }
-      const doc = this.upsert(filePath);
-      if (doc) this.emit(kind, doc);
+
+      if (this._shouldIgnore(currentPath)) {
+        return;
+      }
+
+      let stats;
+      try {
+        stats = fs.statSync(currentPath);
+      } catch (err) {
+        this.emit('error', err);
+        return;
+      }
+
+      const doc = this._createFileDoc(currentPath, stats);
+      if (doc) {
+        const before = this.collection.findOne({ path: doc.path });
+        this._upsertFile(doc);
+        results.total++;
+
+        if (!before) results.added++;
+        else if (before.mtime !== doc.mtime || before.size !== doc.size) results.updated++;
+        else results.skipped++;
+
+        if (this.delay > 0) {
+          await this._sleep(this.delay);
+        }
+      }
+
+      if (stats.isDirectory() && this.recursive) {
+        let entries;
+        try {
+          entries = fs.readdirSync(currentPath);
+        } catch (err) {
+          this.emit('error', err);
+          return;
+        }
+
+        for (const entry of entries) {
+          if (this._stopRequested) return;
+          const full = path.join(currentPath, entry);
+          await walk(full);
+        }
+      }
     };
-    if (!this.delay) {
-      run();
-      return;
+
+    await walk(path.resolve(rootPath));
+    return results;
+  }
+
+  async _runFullScan() {
+    this.isScanning = true;
+    this.emit('scan-start');
+
+    let totalStats = { total: 0, added: 0, updated: 0, skipped: 0 };
+
+    for (const p of this.paths) {
+      if (this._stopRequested) break;
+      const stats = await this._scanPath(p);
+      totalStats.total += stats.total;
+      totalStats.added += stats.added;
+      totalStats.updated += stats.updated;
+      totalStats.skipped += stats.skipped;
     }
-    this.pending.set(filePath, setTimeout(run, this.delay));
+
+    this.isScanning = false;
+    this.emit('scan-end', totalStats);
+    return totalStats;
   }
 
-  upsert(filePath) {
-    if (this.isIgnored(filePath)) return null;
-    const record = statFile(filePath);
-    if (!record || !this.shouldSave(record)) return null;
+  // ====================== WATCHER ======================
+  _startWatcher() {
+    const watchPaths = this.paths.map(p => path.resolve(p));
 
-    const existing = this.files.findOne({ path: record.path });
-    if (existing) {
-      this.files.updateOne({ path: record.path }, { $set: record });
-      const saved = this.files.findOne({ path: record.path });
-      this.emit("upsert", saved);
-      return saved;
-    }
-    const saved = this.files.insert({
-      ...record,
-      addedAt: new Date().toISOString(),
-    });
-    this.emit("upsert", saved);
-    return saved;
-  }
-
-  remove(filePath) {
-    const abs = toPosix(path.resolve(filePath));
-    const existing = this.files.findOne({ path: abs });
-    if (!existing) return false;
-    this.files.deleteOne({ path: abs });
-    this.emit("remove", existing);
-    return true;
-  }
-
-  list() {
-    return this.files.find({}).toArray();
-  }
-
-  findByExt(ext) {
-    const normalized = ext.startsWith(".") ? ext.toLowerCase() : `.${ext.toLowerCase()}`;
-    return this.files.find({ ext: normalized }).toArray();
-  }
-
-  findByCategory(category) {
-    return this.files.find({ category: String(category).toLowerCase() }).toArray();
-  }
-
-  start() {
-    if (this.watcher) return this.watcher;
-
-    this.watcher = chokidar.watch(this.paths, {
-      persistent: this.persistent,
-      ignoreInitial: this.ignoreInitial,
-      ignored: (watchPath) => this.isIgnored(watchPath),
+    this.watcher = chokidar.watch(watchPaths, {
+      ignored: this.ignored,
+      persistent: true,
+      ignoreInitial: true,          // we already did full scan
+      followSymlinks: false,
+      depth: this.recursive ? undefined : 0,
       awaitWriteFinish: {
-        stabilityThreshold: Math.max(200, this.delay),
-        pollInterval: 50,
-      },
+        stabilityThreshold: 500,
+        pollInterval: 100
+      }
     });
 
     this.watcher
-      .on("add", (filePath) => this.schedule(filePath, "add"))
-      .on("change", (filePath) => this.schedule(filePath, "change"))
-      .on("unlink", (filePath) => this.schedule(filePath, "unlink"))
-      .on("error", (err) => this.emit("error", err))
-      .on("ready", () => this.emit("ready", this.list()));
-
-    return this.watcher;
+      .on('add', (filePath) => {
+        try {
+          const stats = fs.statSync(filePath);
+          const doc = this._createFileDoc(filePath, stats);
+          if (doc) this._upsertFile(doc);
+        } catch (err) {
+          this.emit('error', err);
+        }
+      })
+      .on('change', (filePath) => {
+        try {
+          const stats = fs.statSync(filePath);
+          const doc = this._createFileDoc(filePath, stats);
+          if (doc) this._upsertFile(doc);
+        } catch (err) {
+          this.emit('error', err);
+        }
+      })
+      .on('unlink', (filePath) => {
+        this._removeFile(filePath);
+      })
+      .on('error', (err) => {
+        this.emit('error', err);
+      });
   }
 
-  async stop() {
-    for (const timer of this.pending.values()) clearTimeout(timer);
-    this.pending.clear();
-    if (!this.watcher) return;
-    await this.watcher.close();
-    this.watcher = null;
+  // ====================== PUBLIC METHODS ======================
+
+  /**
+   * Start the scanner (async - recommended)
+   */
+  async startAsync() {
+    if (this.isRunning) {
+      throw new Error('Scanner is already running');
+    }
+
+    this._stopRequested = false;
+    this._initDB();
+    this.isRunning = true;
+
+    let stats = null;
+
+    if (this.mode === 'full' || this.mode === 'scan-only') {
+      stats = await this._runFullScan();
+    }
+
+    if (this.mode === 'full' || this.mode === 'watch') {
+      this._startWatcher();
+    }
+
+    this.emit('finish', stats || { total: 0, added: 0, updated: 0, skipped: 0 });
+    return stats;
+  }
+
+  /**
+   * Start the scanner (sync wrapper)
+   */
+  start() {
+    // Fire and forget async version
+    this.startAsync().catch(err => this.emit('error', err));
+  }
+
+  /**
+   * Stop watching
+   */
+  async stopAsync() {
+    this._stopRequested = true;
+
+    if (this.watcher) {
+      await this.watcher.close();
+      this.watcher = null;
+    }
+
+    this.isRunning = false;
+    this.isScanning = false;
+  }
+
+  stop() {
+    this.stopAsync().catch(err => this.emit('error', err));
+  }
+
+  /**
+   * Force a full scan again
+   */
+  async scanAsync() {
+    this._initDB();
+    return await this._runFullScan();
+  }
+
+  scan() {
+    this.scanAsync().catch(err => this.emit('error', err));
+  }
+
+  // ====================== DB UTILITIES ======================
+
+  /**
+   * Get all files (optional filter)
+   */
+  getFiles(filter = {}) {
+    this._initDB();
+    return this.collection.find(filter).toArray();
+  }
+
+  getFilesAsync(filter = {}) {
+    return Promise.resolve(this.getFiles(filter));
+  }
+
+  /**
+   * Find files
+   */
+  find(filter = {}) {
+    this._initDB();
+    return this.collection.find(filter);
+  }
+
+  findOne(filter = {}) {
+    this._initDB();
+    return this.collection.findOne(filter);
+  }
+
+  /**
+   * Count files
+   */
+  count(filter = {}) {
+    this._initDB();
+    return this.collection.find(filter).count();
+  }
+
+  countAsync(filter = {}) {
+    return Promise.resolve(this.count(filter));
+  }
+
+  /**
+   * Delete ALL data in the collection
+   */
+  deleteAll() {
+    this._initDB();
+    // Drop and recreate collection
+    this.db.dropCollection(this.collectionName);
+    this.collection = this.db.collection({
+      name: this.collectionName,
+      autoId: true,
+      indexes: ['path', 'category', 'extension'],
+      pretty: true
+    });
+    return true;
+  }
+
+  deleteAllAsync() {
+    return Promise.resolve(this.deleteAll());
   }
 }
 
-module.exports = { FileScanner, statFile, classify, asList };
+module.exports = { FileScanner };
