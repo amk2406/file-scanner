@@ -1,16 +1,26 @@
 {
-  "name": "file-scanner",
-  "version": "1.0.0",
-  "description": "Simple Node.js file scanner using chokidar and low-json-db",
+  "name": "node-file-scanner",
+  "version": "1.0.1",
+  "description": "A file system scanner using chokidar + chunkjson-db. Supports full scan, live watching, categories, smart re-scan, and events.",
   "main": "file-scanner.js",
   "scripts": {
-    "start": "node example.js",
-    "scan": "node example.js"
+    "example": "node example.js"
   },
-  "keywords": ["chokidar", "low-json-db", "file-scanner", "watcher"],
+  "keywords": [
+    "node-file-scanner",
+    "chokidar",
+    "file-json-db",
+    "filesystem",
+    "watcher",
+    "indexer"
+  ],
+  "author": "Amk <abdulamk2406@gmail.com>",
   "license": "MIT",
   "dependencies": {
-    "chokidar": "^4.0.3",
-    "low-json-db": "^1.0.2"
+    "chokidar": "^3.6.0",
+    "file-json-db": "^1.0.2"
+  },
+  "engines": {
+    "node": ">=14.0.0"
   }
 }
